@@ -2,6 +2,8 @@ import time
 import argparse
 import csv
 import re
+import ast
+import json
 from torch.autograd import Variable
 import pickle
 import torch
@@ -118,6 +120,8 @@ parser.add_argument('--llm_lora_dropout', type=float, default=0.05)
 parser.add_argument('--llm_alpha_init', type=float, default=0.1)
 parser.add_argument('--segment_aligned_refine', action='store_true',
                     help='If enabled, parse note segments and align each text part to action time span.')
+parser.add_argument('--log_interval', type=int, default=20,
+                    help='Log train progress every N iterations (default: 20)')
 parser.add_argument('--mstemba_init_ckpt', type=str, default='',
                     help='Path to a pretrained MSTemba checkpoint to initialize model weights')
 parser.add_argument('--freeze_mstemba', action='store_true',
@@ -127,6 +131,12 @@ parser.add_argument('--llm_device', type=str, default='cuda',
 parser.add_argument('--llm_torch_dtype', type=str, default='float16',
                     choices=['float16', 'bfloat16', 'float32'],
                     help='Torch dtype used when loading LLM refiner weights')                    
+parser.add_argument('--llm_device_map', type=str, default='none',
+                    help='Transformers device_map for LLM loading: none or auto')
+parser.add_argument('--llm_max_memory', type=str, default='',
+                    help='Optional JSON max_memory for LLM loading, e.g. {"0":"2GiB","1":"10GiB"}')
+parser.add_argument('--gpu_ids', type=str, default='0',
+                    help='Comma-separated CUDA device ids for MSTemba, e.g. 0 or 0,1,2')
 # ----- for test -----
 
 
@@ -148,6 +158,40 @@ batch_size = int(args.batch_size)
 
 from charades_dataloader import Charades as Dataset
 
+
+def _parse_llm_max_memory(raw_value: str):
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if text == "":
+        return None
+
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            obj = ast.literal_eval(text)
+        except Exception:
+            obj = {}
+            for item in text.split(','):
+                item = item.strip()
+                if not item:
+                    continue
+                if ':' not in item:
+                    raise ValueError(
+                        f"Invalid llm_max_memory segment: {item}. Expected key:value format."
+                    )
+                k, v = item.split(':', 1)
+                obj[k.strip()] = v.strip()
+
+    if not isinstance(obj, dict):
+        raise ValueError("llm_max_memory must parse to a dict-like object.")
+
+    out = {}
+    for k, v in obj.items():
+        key = int(k) if isinstance(k, str) and k.isdigit() else k
+        out[key] = v
+    return out
 
 
 def _load_mstemba_checkpoint(model, ckpt_path):
@@ -384,16 +428,6 @@ def run_network(model, data, gpu, epoch=0, baseline=False, llm_refiner=None):
     tot = torch.sum(mask)
 
 
-    if llm_refiner is not None:
-        notes = None
-        if isinstance(other, (list, tuple)) and len(other) > 3:
-            notes = other[3]
-            if isinstance(notes, tuple):
-                notes = list(notes)
-            if isinstance(notes, str):
-                notes = [notes]
-        inputs = llm_refiner(inputs, notes=notes)
-
     return outputs_final, loss, probs_f, corr / tot
 
 
@@ -403,9 +437,14 @@ def train_step(model, gpu, optimizer, dataloader, epoch, llm_refiner=None):
     error = 0.0
     num_iter = 0.
     apm = APMeter()
+    total_steps = len(dataloader)
+    step_start_time = time.time()
+    logging.info(f"Epoch {epoch}: waiting for first batch from dataloader (total_steps={total_steps})...")
     for data in dataloader:
         optimizer.zero_grad()
         num_iter += 1
+        if int(num_iter) == 1:
+            logging.info(f"Epoch {epoch}: first batch loaded after {time.time() - step_start_time:.2f}s")
         outputs, loss, probs, err = run_network(model, data, gpu, epoch, llm_refiner=llm_refiner)
         apm.add(probs.data.cpu().numpy()[0], data[2].numpy()[0])
         error += err.data
@@ -413,6 +452,20 @@ def train_step(model, gpu, optimizer, dataloader, epoch, llm_refiner=None):
 
         loss.backward()
         optimizer.step()
+
+        if int(num_iter) % max(1, args.log_interval) == 0 or int(num_iter) == total_steps:
+            elapsed = time.time() - step_start_time
+            avg_step_sec = elapsed / max(1, int(num_iter))
+            remaining_steps = max(0, total_steps - int(num_iter))
+            eta_sec = int(remaining_steps * avg_step_sec)
+            eta_mm = eta_sec // 60
+            eta_ss = eta_sec % 60
+            avg_loss = float(tot_loss / max(1, num_iter))
+            logging.info(
+                f"Epoch {epoch} progress: {int(num_iter)}/{total_steps} "
+                f"({100.0 * int(num_iter) / max(1, total_steps):.1f}%), "
+                f"avg_loss={avg_loss:.6f}, eta={eta_mm:02d}:{eta_ss:02d}"
+            )
 
     train_map = 100 * apm.value().mean()
     logging.info(f'Epoch {epoch}, train-map: {train_map:.4f}')
@@ -671,11 +724,17 @@ if __name__ == '__main__':
             llm_torch_dtype = getattr(args, "llm_torch_dtype", "float16")
             llm_device = getattr(args, "llm_device", "cuda")
             llm_local_files_only = getattr(args, "llm_local_files_only", False)
+            llm_device_map = getattr(args, "llm_device_map", "none")
+            llm_max_memory = getattr(args, "llm_max_memory", "")
             llm_dtype = {
                 "float16": torch.float16,
                 "bfloat16": torch.bfloat16,
                 "float32": torch.float32,
             }.get(llm_torch_dtype, torch.float16)
+            max_memory_dict = None
+            if llm_max_memory:
+                max_memory_dict = _parse_llm_max_memory(llm_max_memory)
+
             refiner_kwargs = dict(
                 in_feat_dim=in_feat_dim,
                 llm_name_or_path=args.llm_name_or_path,
@@ -685,11 +744,23 @@ if __name__ == '__main__':
                 alpha_init=args.llm_alpha_init,
                 torch_dtype=llm_dtype,
             )
-            # Backward compatibility: some legacy refiner copies do not accept local_files_only.
-            if "local_files_only" in inspect.signature(QwenLoRARefiner.__init__).parameters:
+            # Backward compatibility: some legacy refiner copies do not accept these kwargs.
+            refiner_sig = inspect.signature(QwenLoRARefiner.__init__).parameters
+            if "local_files_only" in refiner_sig:
                 refiner_kwargs["local_files_only"] = llm_local_files_only
-            llm_refiner = QwenLoRARefiner(**refiner_kwargs).to(torch.device(llm_device))
-            logging.info(f"Enabled LLM refiner: {args.llm_name_or_path} on {llm_device} ({llm_torch_dtype})")
+            if "device_map" in refiner_sig and llm_device_map != "none":
+                refiner_kwargs["device_map"] = llm_device_map
+            if "max_memory" in refiner_sig and max_memory_dict is not None:
+                refiner_kwargs["max_memory"] = max_memory_dict
+
+            llm_refiner = QwenLoRARefiner(**refiner_kwargs)
+            if llm_device_map == "none":
+                llm_refiner = llm_refiner.to(torch.device(llm_device))
+                logging.info(f"Enabled LLM refiner: {args.llm_name_or_path} on {llm_device} ({llm_torch_dtype})")
+            else:
+                logging.info(
+                    f"Enabled LLM refiner with device_map={llm_device_map}, max_memory={max_memory_dict}, dtype={llm_torch_dtype}"
+                )
         # Create model using timm's create_model function
         model = create_model(
             args.model,
@@ -700,13 +771,24 @@ if __name__ == '__main__':
             drop_block_rate=None,
             in_feat_dim=in_feat_dim
         )
-        model.cuda()
 
+        gpu_ids = [int(x.strip()) for x in str(args.gpu_ids).split(',') if x.strip() != '']
+        if len(gpu_ids) == 0:
+            gpu_ids = [0]
+        primary_gpu = gpu_ids[0]
+        torch.cuda.set_device(primary_gpu)
+        model = model.cuda(primary_gpu)
 
         _load_mstemba_checkpoint(model, args.mstemba_init_ckpt)
         if args.freeze_mstemba:
             _set_trainable(model, False)
             logging.info("MSTemba parameters are frozen (requires_grad=False).")
+
+        if len(gpu_ids) > 1:
+            model = nn.DataParallel(model, device_ids=gpu_ids)
+            logging.info(f"Using DataParallel for MSTemba on GPUs: {gpu_ids}")
+        else:
+            logging.info(f"Using single GPU for MSTemba: {primary_gpu}")
 
 
 
@@ -716,14 +798,28 @@ if __name__ == '__main__':
 
 
         if llm_refiner is None:
-            optimizer = create_optimizer(args, model)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
         else:
-            optimizer = optim.AdamW(
-                list(model.parameters()) + list(llm_refiner.parameters()),
-                lr=args.lr,
-                weight_decay=args.weight_decay
+            trainable_params = [p for p in model.parameters() if p.requires_grad] + [
+                p for p in llm_refiner.parameters() if p.requires_grad
+            ]
+
+        if len(trainable_params) == 0:
+            raise RuntimeError(
+                "No trainable parameters found. Check freeze settings and whether LoRA parameters are enabled."
             )
 
+        trainable_devices = sorted({str(p.device) for p in trainable_params})
+        logging.info(
+            f"Trainable parameter tensors: {len(trainable_params)}, devices={trainable_devices}"
+        )
+
+        optimizer = optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            foreach=False,
+        )
 
         lr_scheduler, _ = create_scheduler(args, optimizer)
 
@@ -740,4 +836,4 @@ if __name__ == '__main__':
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging.info(f"Number of parameters: {n_parameters}")
 
-        run([(model, 0, dataloaders, optimizer, lr_scheduler, args.comp_info)], criterion, num_epochs=int(args.epochs), llm_refiner=llm_refiner)
+        run([(model, primary_gpu, dataloaders, optimizer, lr_scheduler, args.comp_info)], criterion, num_epochs=int(args.epochs), llm_refiner=llm_refiner)

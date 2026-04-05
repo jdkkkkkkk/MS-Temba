@@ -20,6 +20,9 @@ class QwenLoRARefiner(nn.Module):
         target_modules=None,
         torch_dtype: torch.dtype = torch.float16,
         max_note_tokens: int = 64,
+        local_files_only: bool = False,
+        device_map=None,
+        max_memory=None,
     ):
         super().__init__()
         try:
@@ -40,10 +43,19 @@ class QwenLoRARefiner(nn.Module):
         self.in_feat_dim = in_feat_dim
         self.max_note_tokens = max_note_tokens
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            llm_name_or_path,
+        load_kwargs = dict(
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
+            local_files_only=local_files_only,
+        )
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            llm_name_or_path,
+            **load_kwargs,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path, use_fast=True)
         if self.tokenizer.pad_token is None:
@@ -91,6 +103,17 @@ class QwenLoRARefiner(nn.Module):
 
     def forward(self, x: torch.Tensor, notes=None, segment_notes=None, segment_spans=None) -> torch.Tensor:
         # x: [B, C, T]
+        embed_tokens = getattr(self.backbone, "embed_tokens", None)
+        target_device = embed_tokens.weight.device if embed_tokens is not None else self.in_proj.weight.device
+
+        if self.in_proj.weight.device != target_device:
+            self.in_proj = self.in_proj.to(target_device)
+            self.out_proj = self.out_proj.to(target_device)
+            self.alpha.data = self.alpha.data.to(target_device)
+
+        if x.device != target_device:
+            x = x.to(target_device)
+
         x_bt = x.transpose(1, 2)  # [B, T, C]
         h = self.in_proj(x_bt)
 

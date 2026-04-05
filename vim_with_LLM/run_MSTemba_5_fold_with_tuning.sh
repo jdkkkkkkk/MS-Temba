@@ -19,6 +19,15 @@ MIN_LR="${MIN_LR:-1e-5}"
 NUM_CLIPS="${NUM_CLIPS:-256}"
 ALPHA_L="${ALPHA_L:-1.0}"
 BETA_L="${BETA_L:-0.05}"
+LLM_MODEL_PATH="${LLM_MODEL_PATH:-/home/amax/ms_temba/MS-Temba-main/vim_with_LLM/insert_llm/qwen2.5_7b/}"
+MSTEMBA_GPU_IDS="${MSTEMBA_GPU_IDS:-0}"
+LLM_DEVICE="${LLM_DEVICE:-cuda:1}"
+LLM_DEVICE_MAP="${LLM_DEVICE_MAP:-auto}"
+if [ -z "${LLM_MAX_MEMORY:-}" ]; then
+  LLM_MAX_MEMORY='{"0":"2GiB","1":"10GiB","2":"10GiB","cpu":"64GiB"}'
+fi
+LLM_DTYPE="${LLM_DTYPE:-float16}"
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
 # BATCH_SIZE="${BATCH_SIZE:-5}"
 # EPOCHS="${EPOCHS:-50}"
 
@@ -64,11 +73,15 @@ do
     --min-lr "${MIN_LR}" \
     -output_dir "${FOLD_OUTPUT}" \
     --use_llm_refiner \
-    --llm_name_or_path /home/amax/ms_temba/MS-Temba-main/vim_with_LLM/insert_llm/qwen2.5_7b/ \
+    --llm_name_or_path "${LLM_MODEL_PATH}" \
     --mstemba_init_ckpt /home/amax/ms_temba/data/reinforced_data_1/output_5fold_tuned_0_1/fold_4/best_model.pth \
     --freeze_mstemba \
-    --llm_device cpu \
-    --llm_torch_dtype float32
+    --gpu_ids "${MSTEMBA_GPU_IDS}" \
+    --llm_device "${LLM_DEVICE}" \
+    --llm_device_map "${LLM_DEVICE_MAP}" \
+    --llm_max_memory "${LLM_MAX_MEMORY}" \
+    --llm_torch_dtype "${LLM_DTYPE}" \
+    --log_interval "${LOG_INTERVAL}"
 
   python extract_metrics.py \
     --fold_dir "${FOLD_OUTPUT}" \
