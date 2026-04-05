@@ -127,6 +127,31 @@ class QwenLoRARefiner(nn.Module):
                 if video_tokens.is_cuda:
                     torch.cuda.empty_cache()
 
+    def _forward_backbone_chunked(self, video_tokens, text_embeds=None, text_mask=None):
+        # video_tokens: [1, T, H]
+        # text_embeds:  [1, L, H] or None
+        # text_mask:    [1, L] or None
+        t = video_tokens.shape[1]
+        chunk_size = int(self.max_video_tokens) if self.max_video_tokens is not None else t
+        if chunk_size <= 0:
+            chunk_size = t
+
+        outputs = []
+        for start in range(0, t, chunk_size):
+            end = min(start + chunk_size, t)
+            seg_tokens = video_tokens[:, start:end, :]
+            if text_embeds is not None:
+                llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
+                video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=seg_tokens.device)
+                attn_mask = torch.cat([text_mask, video_mask], dim=1)
+                y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
+                y_seg = y_all[:, text_embeds.shape[1]:, :]
+            else:
+                y_seg = self.backbone(inputs_embeds=seg_tokens).last_hidden_state
+            outputs.append(y_seg)
+
+        return torch.cat(outputs, dim=1)
+
     def _encode_text(self, text: str, device, dtype):
         if text is None:
             text = ""
@@ -177,7 +202,12 @@ class QwenLoRARefiner(nn.Module):
                         continue
                     seg_tokens = h[b:b+1, s:e, :]  # [1, t_seg, H]
                     text_embeds, text_mask = self._encode_text(sample_notes[i], h.device, target_dtype)
-                    y_seg = self._forward_backbone_chunked(seg_tokens, text_embeds=text_embeds, text_mask=text_mask)
+                    llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
+                    video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=h.device)
+                    attn_mask = torch.cat([text_mask, video_mask], dim=1)
+                    y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
+                    text_len = text_embeds.shape[1]
+                    y_seg = y_all[:, text_len:, :]
                     delta_seg = self.out_proj(y_seg)
                     refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(seg_tokens.dtype) * delta_seg
 
@@ -193,15 +223,12 @@ class QwenLoRARefiner(nn.Module):
             input_ids = tok["input_ids"].to(device=x_bt.device, dtype=torch.long)
             text_mask = tok["attention_mask"].to(device=x_bt.device, dtype=torch.long)
             text_embeds = self.backbone.embed_tokens(input_ids).to(dtype=target_dtype)
-            y_list = []
-            for b in range(x_bt.shape[0]):
-                y_b = self._forward_backbone_chunked(
-                    h[b:b+1, :, :],
-                    text_embeds=text_embeds[b:b+1, :, :],
-                    text_mask=text_mask[b:b+1, :],
-                )
-                y_list.append(y_b)
-            y = torch.cat(y_list, dim=0)
+            llm_inputs = torch.cat([text_embeds, h], dim=1)
+            video_mask = torch.ones((x_bt.shape[0], h.shape[1]), dtype=text_mask.dtype, device=x_bt.device)
+            attn_mask = torch.cat([text_mask, video_mask], dim=1)
+            y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
+            text_len = text_embeds.shape[1]
+            y = y_all[:, text_len:, :]
         else:
             y_list = []
             for b in range(x_bt.shape[0]):

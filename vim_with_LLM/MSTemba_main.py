@@ -131,7 +131,7 @@ parser.add_argument('--llm_device', type=str, default='cuda',
 parser.add_argument('--llm_torch_dtype', type=str, default='float16',
                     choices=['float16', 'bfloat16', 'float32'],
                     help='Torch dtype used when loading LLM refiner weights')                    
-parser.add_argument('--llm_max_video_tokens', type=int, default=64,
+parser.add_argument('--llm_max_video_tokens', type=int, default=192,
                     help='Max video timesteps per LLM forward chunk to control VRAM usage')
 parser.add_argument('--disable_llm_gradient_checkpointing', action='store_true',
                     help='Disable gradient checkpointing inside LLM refiner')
