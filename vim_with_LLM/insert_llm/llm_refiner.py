@@ -89,6 +89,43 @@ class QwenLoRARefiner(nn.Module):
             target_modules=target_modules,
         )
         self.backbone = get_peft_model(self.backbone, lora_cfg)
+        if gradient_checkpointing and hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
+        if gradient_checkpointing and hasattr(self.backbone, "enable_input_require_grads"):
+            self.backbone.enable_input_require_grads()
+
+    def _forward_backbone_chunked(self, video_tokens, text_embeds=None, text_mask=None):
+        # video_tokens: [1, T, H]
+        # text_embeds:  [1, L, H] or None
+        # text_mask:    [1, L] or None
+        t = video_tokens.shape[1]
+        chunk_size = int(self.max_video_tokens) if self.max_video_tokens is not None else t
+        if chunk_size <= 0:
+            chunk_size = t
+
+        while True:
+            try:
+                outputs = []
+                for start in range(0, t, chunk_size):
+                    end = min(start + chunk_size, t)
+                    seg_tokens = video_tokens[:, start:end, :]
+                    if text_embeds is not None:
+                        llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
+                        video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=seg_tokens.device)
+                        attn_mask = torch.cat([text_mask, video_mask], dim=1)
+                        y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
+                        y_seg = y_all[:, text_embeds.shape[1]:, :]
+                    else:
+                        y_seg = self.backbone(inputs_embeds=seg_tokens).last_hidden_state
+                    outputs.append(y_seg)
+                return torch.cat(outputs, dim=1)
+            except RuntimeError as e:
+                oom = "out of memory" in str(e).lower()
+                if (not oom) or chunk_size <= 1:
+                    raise
+                chunk_size = max(1, chunk_size // 2)
+                if video_tokens.is_cuda:
+                    torch.cuda.empty_cache()
 
     def _forward_backbone_chunked(self, video_tokens, text_embeds=None, text_mask=None):
         # video_tokens: [1, T, H]
