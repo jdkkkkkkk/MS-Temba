@@ -145,6 +145,12 @@ parser.add_argument('--gpu_ids', type=str, default='0',
 
 
 args = parser.parse_args()
+if not hasattr(args, "llm_train_backbone_lora"):
+    args.llm_train_backbone_lora = False
+if not hasattr(args, "disable_llm_gradient_checkpointing"):
+    args.disable_llm_gradient_checkpointing = False
+if not hasattr(args, "llm_max_video_tokens"):
+    args.llm_max_video_tokens = 64
 
 # set random seed
 SEED = 0
