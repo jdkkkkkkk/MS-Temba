@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
 
 
 class QwenLoRARefiner(nn.Module):
@@ -209,7 +210,9 @@ class QwenLoRARefiner(nn.Module):
                     text_len = text_embeds.shape[1]
                     y_seg = y_all[:, text_len:, :]
                     delta_seg = self.out_proj(y_seg)
-                    refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(seg_tokens.dtype) * delta_seg
+                    if delta_seg.device != seg_tokens.device:
+                        delta_seg = delta_seg.to(seg_tokens.device)
+                    refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(device=seg_tokens.device, dtype=seg_tokens.dtype) * delta_seg
 
             return refined_h.to(dtype=x_bt.dtype).transpose(1, 2)  # [B, C, T]
 
@@ -236,6 +239,8 @@ class QwenLoRARefiner(nn.Module):
                 y_list.append(y_b)
             y = torch.cat(y_list, dim=0)
         delta = self.out_proj(y)
+        if delta.device != x_bt_model.device:
+            delta = delta.to(x_bt_model.device)
 
         x_refined = x_bt_model + self.alpha.to(x_bt_model.dtype) * delta
         x_refined = x_refined.to(dtype=x_bt.dtype)
