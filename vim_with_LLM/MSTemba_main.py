@@ -718,6 +718,11 @@ if __name__ == '__main__':
     logging.info(f"Arguments: {args}")
 
     if args.train:
+        gpu_ids = [int(x.strip()) for x in str(args.gpu_ids).split(',') if x.strip() != '']
+        if len(gpu_ids) == 0:
+            gpu_ids = [0]
+        primary_gpu = gpu_ids[0]
+
         if args.backbone == 'i3d':
             in_feat_dim = 1024
         elif args.backbone == 'clip':
@@ -727,8 +732,13 @@ if __name__ == '__main__':
         if args.use_llm_refiner:
             llm_torch_dtype = getattr(args, "llm_torch_dtype", "float16")
             llm_device = getattr(args, "llm_device", "cuda")
+            if llm_device == "cuda":
+                llm_device = f"cuda:{primary_gpu}"
             llm_local_files_only = getattr(args, "llm_local_files_only", False)
             llm_device_map = getattr(args, "llm_device_map", "none")
+            if llm_device_map != "none" and args.llm_train_backbone_lora:
+                logging.warning("llm_device_map is forced to 'none' when training LoRA to avoid cross-device projection errors.")
+                llm_device_map = "none"
             llm_max_memory = getattr(args, "llm_max_memory", "")
             llm_dtype = {
                 "float16": torch.float16,
@@ -780,10 +790,6 @@ if __name__ == '__main__':
             in_feat_dim=in_feat_dim
         )
 
-        gpu_ids = [int(x.strip()) for x in str(args.gpu_ids).split(',') if x.strip() != '']
-        if len(gpu_ids) == 0:
-            gpu_ids = [0]
-        primary_gpu = gpu_ids[0]
         torch.cuda.set_device(primary_gpu)
         model = model.cuda(primary_gpu)
 
