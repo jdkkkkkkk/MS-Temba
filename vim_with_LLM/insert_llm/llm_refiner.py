@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
 
 
 class QwenLoRARefiner(nn.Module):
@@ -20,6 +21,9 @@ class QwenLoRARefiner(nn.Module):
         target_modules=None,
         torch_dtype: torch.dtype = torch.float16,
         max_note_tokens: int = 64,
+        max_video_tokens: int = 192,
+        gradient_checkpointing: bool = True,
+        train_backbone_lora: bool = False,
         local_files_only: bool = False,
         device_map=None,
         max_memory=None,
@@ -42,6 +46,8 @@ class QwenLoRARefiner(nn.Module):
 
         self.in_feat_dim = in_feat_dim
         self.max_note_tokens = max_note_tokens
+        self.max_video_tokens = max_video_tokens
+        self.train_backbone_lora = train_backbone_lora
 
         load_kwargs = dict(
             torch_dtype=torch_dtype,
@@ -63,6 +69,8 @@ class QwenLoRARefiner(nn.Module):
 
         # Use only the decoder backbone hidden states (not lm_head generation).
         self.backbone = base_model.model
+        if gradient_checkpointing and hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
 
         for p in self.backbone.parameters():
             p.requires_grad = False
@@ -84,6 +92,48 @@ class QwenLoRARefiner(nn.Module):
             target_modules=target_modules,
         )
         self.backbone = get_peft_model(self.backbone, lora_cfg)
+        if gradient_checkpointing and hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
+        if gradient_checkpointing and hasattr(self.backbone, "enable_input_require_grads"):
+            self.backbone.enable_input_require_grads()
+        if not self.train_backbone_lora:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def _forward_backbone_chunked(self, video_tokens, text_embeds=None, text_mask=None):
+        # video_tokens: [1, T, H]
+        # text_embeds:  [1, L, H] or None
+        # text_mask:    [1, L] or None
+        t = video_tokens.shape[1]
+        chunk_size = int(self.max_video_tokens) if self.max_video_tokens is not None else t
+        if chunk_size <= 0:
+            chunk_size = t
+
+        while True:
+            try:
+                outputs = []
+                for start in range(0, t, chunk_size):
+                    end = min(start + chunk_size, t)
+                    seg_tokens = video_tokens[:, start:end, :]
+                    grad_ctx = nullcontext() if self.train_backbone_lora else torch.no_grad()
+                    with grad_ctx:
+                        if text_embeds is not None:
+                            llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
+                            video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=seg_tokens.device)
+                            attn_mask = torch.cat([text_mask, video_mask], dim=1)
+                            y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
+                            y_seg = y_all[:, text_embeds.shape[1]:, :]
+                        else:
+                            y_seg = self.backbone(inputs_embeds=seg_tokens).last_hidden_state
+                    outputs.append(y_seg)
+                return torch.cat(outputs, dim=1)
+            except RuntimeError as e:
+                oom = "out of memory" in str(e).lower()
+                if (not oom) or chunk_size <= 1:
+                    raise
+                chunk_size = max(1, chunk_size // 2)
+                if video_tokens.is_cuda:
+                    torch.cuda.empty_cache()
 
     def _encode_text(self, text: str, device, dtype):
         if text is None:
@@ -105,17 +155,19 @@ class QwenLoRARefiner(nn.Module):
         # x: [B, C, T]
         embed_tokens = getattr(self.backbone, "embed_tokens", None)
         target_device = embed_tokens.weight.device if embed_tokens is not None else self.in_proj.weight.device
+        target_dtype = embed_tokens.weight.dtype if embed_tokens is not None else self.in_proj.weight.dtype
 
-        if self.in_proj.weight.device != target_device:
-            self.in_proj = self.in_proj.to(target_device)
-            self.out_proj = self.out_proj.to(target_device)
+        if self.in_proj.weight.device != target_device or self.in_proj.weight.dtype != target_dtype:
+            self.in_proj = self.in_proj.to(device=target_device, dtype=target_dtype)
+            self.out_proj = self.out_proj.to(device=target_device, dtype=target_dtype)
             self.alpha.data = self.alpha.data.to(target_device)
 
         if x.device != target_device:
             x = x.to(target_device)
 
         x_bt = x.transpose(1, 2)  # [B, T, C]
-        h = self.in_proj(x_bt)
+        x_bt_model = x_bt.to(dtype=target_dtype)
+        h = self.in_proj(x_bt_model)
 
         # Segment-aligned mode: refine each temporal span with its paired segment text.
         if segment_notes is not None and segment_spans is not None:
@@ -132,17 +184,16 @@ class QwenLoRARefiner(nn.Module):
                     if e <= s:
                         continue
                     seg_tokens = h[b:b+1, s:e, :]  # [1, t_seg, H]
-                    text_embeds, text_mask = self._encode_text(sample_notes[i], h.device, h.dtype)
-                    llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
-                    video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=h.device)
-                    attn_mask = torch.cat([text_mask, video_mask], dim=1)
-                    y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
-                    text_len = text_embeds.shape[1]
-                    y_seg = y_all[:, text_len:, :]
+                    text_embeds, text_mask = self._encode_text(sample_notes[i], h.device, target_dtype)
+                    y_seg = self._forward_backbone_chunked(seg_tokens, text_embeds=text_embeds, text_mask=text_mask)
+                    if self.out_proj.weight.device != y_seg.device:
+                        self.out_proj = self.out_proj.to(device=y_seg.device, dtype=y_seg.dtype)
                     delta_seg = self.out_proj(y_seg)
-                    refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(seg_tokens.dtype) * delta_seg
+                    if delta_seg.device != seg_tokens.device:
+                        delta_seg = delta_seg.to(seg_tokens.device)
+                    refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(device=seg_tokens.device, dtype=seg_tokens.dtype) * delta_seg
 
-            return refined_h.transpose(1, 2)  # [B, C, T]
+            return refined_h.to(dtype=x_bt.dtype).transpose(1, 2)  # [B, C, T]
 
         if notes is not None:
             if isinstance(notes, str):
@@ -153,18 +204,30 @@ class QwenLoRARefiner(nn.Module):
             tok = self.tokenizer(notes, padding=True, truncation=True, max_length=self.max_note_tokens, return_tensors="pt")
             input_ids = tok["input_ids"].to(device=x_bt.device, dtype=torch.long)
             text_mask = tok["attention_mask"].to(device=x_bt.device, dtype=torch.long)
-            text_embeds = self.backbone.embed_tokens(input_ids).to(h.dtype)
-            llm_inputs = torch.cat([text_embeds, h], dim=1)
-            video_mask = torch.ones((x_bt.shape[0], h.shape[1]), dtype=text_mask.dtype, device=x_bt.device)
-            attn_mask = torch.cat([text_mask, video_mask], dim=1)
-            y_all = self.backbone(inputs_embeds=llm_inputs, attention_mask=attn_mask).last_hidden_state
-            text_len = text_embeds.shape[1]
-            y = y_all[:, text_len:, :]
+            text_embeds = self.backbone.embed_tokens(input_ids).to(dtype=target_dtype)
+            y_list = []
+            for b in range(x_bt.shape[0]):
+                y_b = self._forward_backbone_chunked(
+                    h[b:b+1, :, :],
+                    text_embeds=text_embeds[b:b+1, :, :],
+                    text_mask=text_mask[b:b+1, :],
+                )
+                y_list.append(y_b)
+            y = torch.cat(y_list, dim=0)
         else:
-            y = self.backbone(inputs_embeds=h).last_hidden_state  # [B, T, H]
+            y_list = []
+            for b in range(x_bt.shape[0]):
+                y_b = self._forward_backbone_chunked(h[b:b+1, :, :])
+                y_list.append(y_b)
+            y = torch.cat(y_list, dim=0)
+        if self.out_proj.weight.device != y.device:
+            self.out_proj = self.out_proj.to(device=y.device, dtype=y.dtype)
         delta = self.out_proj(y)
+        if delta.device != x_bt_model.device:
+            delta = delta.to(x_bt_model.device)
 
-        x_refined = x_bt + self.alpha.to(x_bt.dtype) * delta
+        x_refined = x_bt_model + self.alpha.to(device=x_bt_model.device, dtype=x_bt_model.dtype) * delta
+        x_refined = x_refined.to(dtype=x_bt.dtype)
         return x_refined.transpose(1, 2)  # [B, C, T]
 
 
