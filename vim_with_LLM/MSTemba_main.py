@@ -131,12 +131,10 @@ parser.add_argument('--llm_device', type=str, default='cuda',
 parser.add_argument('--llm_torch_dtype', type=str, default='float16',
                     choices=['float16', 'bfloat16', 'float32'],
                     help='Torch dtype used when loading LLM refiner weights')                    
-parser.add_argument('--llm_max_video_tokens', type=int, default=64,
+parser.add_argument('--llm_max_video_tokens', type=int, default=192,
                     help='Max video timesteps per LLM forward chunk to control VRAM usage')
 parser.add_argument('--disable_llm_gradient_checkpointing', action='store_true',
                     help='Disable gradient checkpointing inside LLM refiner')
-parser.add_argument('--llm_train_backbone_lora', action='store_true',
-                    help='Train LoRA adapters inside LLM backbone (higher VRAM). Default is frozen backbone for stability')
 parser.add_argument('--llm_device_map', type=str, default='none',
                     help='Transformers device_map for LLM loading: none or auto')
 parser.add_argument('--llm_max_memory', type=str, default='',
@@ -744,7 +742,7 @@ if __name__ == '__main__':
                 llm_device = f"cuda:{primary_gpu}"
             llm_local_files_only = getattr(args, "llm_local_files_only", False)
             llm_device_map = getattr(args, "llm_device_map", "none")
-            if llm_device_map != "none" and getattr(args, "llm_train_backbone_lora", False):
+            if llm_device_map != "none" and args.llm_train_backbone_lora:
                 logging.warning("llm_device_map is forced to 'none' when training LoRA to avoid cross-device projection errors.")
                 llm_device_map = "none"
             llm_max_memory = getattr(args, "llm_max_memory", "")
@@ -775,11 +773,9 @@ if __name__ == '__main__':
             if "max_memory" in refiner_sig and max_memory_dict is not None:
                 refiner_kwargs["max_memory"] = max_memory_dict
             if "max_video_tokens" in refiner_sig:
-                refiner_kwargs["max_video_tokens"] = getattr(args, "llm_max_video_tokens", 64)
+                refiner_kwargs["max_video_tokens"] = args.llm_max_video_tokens
             if "gradient_checkpointing" in refiner_sig:
-                refiner_kwargs["gradient_checkpointing"] = not getattr(args, "disable_llm_gradient_checkpointing", False)
-            if "train_backbone_lora" in refiner_sig:
-                refiner_kwargs["train_backbone_lora"] = getattr(args, "llm_train_backbone_lora", False)
+                refiner_kwargs["gradient_checkpointing"] = not args.disable_llm_gradient_checkpointing
 
             llm_refiner = QwenLoRARefiner(**refiner_kwargs)
             if llm_device_map == "none":
