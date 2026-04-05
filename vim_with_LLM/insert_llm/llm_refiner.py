@@ -169,6 +169,16 @@ class QwenLoRARefiner(nn.Module):
         text_embeds = self.backbone.embed_tokens(input_ids).to(dtype)
         return text_embeds, text_mask
 
+    def _project_out(self, x: torch.Tensor) -> torch.Tensor:
+        """Device-safe projection for model-parallel outputs."""
+        weight = self.out_proj.weight
+        bias = self.out_proj.bias
+        if weight.device != x.device or weight.dtype != x.dtype:
+            weight = weight.to(device=x.device, dtype=x.dtype)
+            if bias is not None:
+                bias = bias.to(device=x.device, dtype=x.dtype)
+        return F.linear(x, weight, bias)
+
     def forward(self, x: torch.Tensor, notes=None, segment_notes=None, segment_spans=None) -> torch.Tensor:
         # x: [B, C, T]
         embed_tokens = getattr(self.backbone, "embed_tokens", None)
