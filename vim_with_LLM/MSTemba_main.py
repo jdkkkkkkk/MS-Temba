@@ -131,6 +131,12 @@ parser.add_argument('--llm_device', type=str, default='cuda',
 parser.add_argument('--llm_torch_dtype', type=str, default='float16',
                     choices=['float16', 'bfloat16', 'float32'],
                     help='Torch dtype used when loading LLM refiner weights')                    
+parser.add_argument('--llm_max_video_tokens', type=int, default=64,
+                    help='Max video timesteps per LLM forward chunk to control VRAM usage')
+parser.add_argument('--disable_llm_gradient_checkpointing', action='store_true',
+                    help='Disable gradient checkpointing inside LLM refiner')
+parser.add_argument('--llm_train_backbone_lora', action='store_true',
+                    help='Train LoRA adapters inside LLM backbone (higher VRAM). Default is frozen backbone for stability')
 parser.add_argument('--llm_device_map', type=str, default='none',
                     help='Transformers device_map for LLM loading: none or auto')
 parser.add_argument('--llm_max_memory', type=str, default='',
@@ -141,6 +147,12 @@ parser.add_argument('--gpu_ids', type=str, default='0',
 
 
 args = parser.parse_args()
+if not hasattr(args, "llm_train_backbone_lora"):
+    args.llm_train_backbone_lora = False
+if not hasattr(args, "disable_llm_gradient_checkpointing"):
+    args.disable_llm_gradient_checkpointing = False
+if not hasattr(args, "llm_max_video_tokens"):
+    args.llm_max_video_tokens = 64
 
 # set random seed
 SEED = 0
@@ -714,6 +726,11 @@ if __name__ == '__main__':
     logging.info(f"Arguments: {args}")
 
     if args.train:
+        gpu_ids = [int(x.strip()) for x in str(args.gpu_ids).split(',') if x.strip() != '']
+        if len(gpu_ids) == 0:
+            gpu_ids = [0]
+        primary_gpu = gpu_ids[0]
+
         if args.backbone == 'i3d':
             in_feat_dim = 1024
         elif args.backbone == 'clip':
@@ -723,8 +740,13 @@ if __name__ == '__main__':
         if args.use_llm_refiner:
             llm_torch_dtype = getattr(args, "llm_torch_dtype", "float16")
             llm_device = getattr(args, "llm_device", "cuda")
+            if llm_device == "cuda":
+                llm_device = f"cuda:{primary_gpu}"
             llm_local_files_only = getattr(args, "llm_local_files_only", False)
             llm_device_map = getattr(args, "llm_device_map", "none")
+            if llm_device_map != "none" and getattr(args, "llm_train_backbone_lora", False):
+                logging.warning("llm_device_map is forced to 'none' when training LoRA to avoid cross-device projection errors.")
+                llm_device_map = "none"
             llm_max_memory = getattr(args, "llm_max_memory", "")
             llm_dtype = {
                 "float16": torch.float16,
@@ -752,6 +774,12 @@ if __name__ == '__main__':
                 refiner_kwargs["device_map"] = llm_device_map
             if "max_memory" in refiner_sig and max_memory_dict is not None:
                 refiner_kwargs["max_memory"] = max_memory_dict
+            if "max_video_tokens" in refiner_sig:
+                refiner_kwargs["max_video_tokens"] = getattr(args, "llm_max_video_tokens", 64)
+            if "gradient_checkpointing" in refiner_sig:
+                refiner_kwargs["gradient_checkpointing"] = not getattr(args, "disable_llm_gradient_checkpointing", False)
+            if "train_backbone_lora" in refiner_sig:
+                refiner_kwargs["train_backbone_lora"] = getattr(args, "llm_train_backbone_lora", False)
 
             llm_refiner = QwenLoRARefiner(**refiner_kwargs)
             if llm_device_map == "none":
@@ -772,10 +800,6 @@ if __name__ == '__main__':
             in_feat_dim=in_feat_dim
         )
 
-        gpu_ids = [int(x.strip()) for x in str(args.gpu_ids).split(',') if x.strip() != '']
-        if len(gpu_ids) == 0:
-            gpu_ids = [0]
-        primary_gpu = gpu_ids[0]
         torch.cuda.set_device(primary_gpu)
         model = model.cuda(primary_gpu)
 
