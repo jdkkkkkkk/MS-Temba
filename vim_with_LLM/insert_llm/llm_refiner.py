@@ -105,17 +105,19 @@ class QwenLoRARefiner(nn.Module):
         # x: [B, C, T]
         embed_tokens = getattr(self.backbone, "embed_tokens", None)
         target_device = embed_tokens.weight.device if embed_tokens is not None else self.in_proj.weight.device
+        target_dtype = embed_tokens.weight.dtype if embed_tokens is not None else self.in_proj.weight.dtype
 
-        if self.in_proj.weight.device != target_device:
-            self.in_proj = self.in_proj.to(target_device)
-            self.out_proj = self.out_proj.to(target_device)
+        if self.in_proj.weight.device != target_device or self.in_proj.weight.dtype != target_dtype:
+            self.in_proj = self.in_proj.to(device=target_device, dtype=target_dtype)
+            self.out_proj = self.out_proj.to(device=target_device, dtype=target_dtype)
             self.alpha.data = self.alpha.data.to(target_device)
 
         if x.device != target_device:
             x = x.to(target_device)
 
         x_bt = x.transpose(1, 2)  # [B, T, C]
-        h = self.in_proj(x_bt)
+        x_bt_model = x_bt.to(dtype=target_dtype)
+        h = self.in_proj(x_bt_model)
 
         # Segment-aligned mode: refine each temporal span with its paired segment text.
         if segment_notes is not None and segment_spans is not None:
@@ -132,7 +134,7 @@ class QwenLoRARefiner(nn.Module):
                     if e <= s:
                         continue
                     seg_tokens = h[b:b+1, s:e, :]  # [1, t_seg, H]
-                    text_embeds, text_mask = self._encode_text(sample_notes[i], h.device, h.dtype)
+                    text_embeds, text_mask = self._encode_text(sample_notes[i], h.device, target_dtype)
                     llm_inputs = torch.cat([text_embeds, seg_tokens], dim=1)
                     video_mask = torch.ones((1, seg_tokens.shape[1]), dtype=text_mask.dtype, device=h.device)
                     attn_mask = torch.cat([text_mask, video_mask], dim=1)
@@ -142,7 +144,7 @@ class QwenLoRARefiner(nn.Module):
                     delta_seg = self.out_proj(y_seg)
                     refined_h[b:b+1, s:e, :] = seg_tokens + self.alpha.to(seg_tokens.dtype) * delta_seg
 
-            return refined_h.transpose(1, 2)  # [B, C, T]
+            return refined_h.to(dtype=x_bt.dtype).transpose(1, 2)  # [B, C, T]
 
         if notes is not None:
             if isinstance(notes, str):
@@ -153,7 +155,7 @@ class QwenLoRARefiner(nn.Module):
             tok = self.tokenizer(notes, padding=True, truncation=True, max_length=self.max_note_tokens, return_tensors="pt")
             input_ids = tok["input_ids"].to(device=x_bt.device, dtype=torch.long)
             text_mask = tok["attention_mask"].to(device=x_bt.device, dtype=torch.long)
-            text_embeds = self.backbone.embed_tokens(input_ids).to(h.dtype)
+            text_embeds = self.backbone.embed_tokens(input_ids).to(dtype=target_dtype)
             llm_inputs = torch.cat([text_embeds, h], dim=1)
             video_mask = torch.ones((x_bt.shape[0], h.shape[1]), dtype=text_mask.dtype, device=x_bt.device)
             attn_mask = torch.cat([text_mask, video_mask], dim=1)
@@ -164,7 +166,8 @@ class QwenLoRARefiner(nn.Module):
             y = self.backbone(inputs_embeds=h).last_hidden_state  # [B, T, H]
         delta = self.out_proj(y)
 
-        x_refined = x_bt + self.alpha.to(x_bt.dtype) * delta
+        x_refined = x_bt_model + self.alpha.to(x_bt_model.dtype) * delta
+        x_refined = x_refined.to(dtype=x_bt.dtype)
         return x_refined.transpose(1, 2)  # [B, C, T]
 
 
